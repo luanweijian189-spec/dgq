@@ -27,6 +27,14 @@ SUMMARY_PROMPT = (
 	"4) 主要实验或结果；5) 局限性或未来工作。"
 	"输出使用清晰的分段文本，不要使用JSON格式。"
 )
+MAX_PDF_SIZE = 50 * 1024 * 1024
+DOWNLOAD_HEADERS = {
+	"User-Agent": "dgq/1.0 (+https://arxiv.org)",
+	"Accept": "application/pdf"
+}
+ALLOWED_PDF_HOST_SUFFIX = ".arxiv.org"
+AI_API_URL = "https://api.gpt.ge/v1/chat/completions"
+AI_MODEL = "gemini-2.5-pro"
 
 def format_time_string(timestamp):
 	local_time = time.localtime(timestamp)
@@ -63,25 +71,52 @@ def is_url(value):
 
 def sanitize_filename(filename):
 	filename = unescape(filename)
-	filename = re.sub(r'[^A-Za-z0-9._-]', '_', filename)
+	filename = re.sub(r'[\\/:*?"<>|]', '_', filename)
 	return filename or "paper.pdf"
 
+def ensure_unique_path(file_path):
+	if not os.path.exists(file_path):
+		return file_path
+	base, ext = os.path.splitext(file_path)
+	index = 1
+	while True:
+		candidate = f"{base}_{index}{ext}"
+		if not os.path.exists(candidate):
+			return candidate
+		index += 1
+
 def download_pdf(url, output_dir):
-	os.makedirs(output_dir, exist_ok=True)
 	parsed = urlparse(url)
+	host = parsed.hostname or ""
+	if host != "arxiv.org" and not host.endswith(ALLOWED_PDF_HOST_SUFFIX):
+		raise ValueError("仅支持arXiv论文链接")
+	os.makedirs(output_dir, exist_ok=True)
 	filename = sanitize_filename(os.path.basename(parsed.path) or "paper.pdf")
 	if not filename.lower().endswith(".pdf"):
 		filename += ".pdf"
-	file_path = os.path.join(output_dir, filename)
-	response = requests.get(url, stream=True, timeout=60)
+	file_path = ensure_unique_path(os.path.join(output_dir, filename))
+	response = requests.get(url, stream=True, timeout=60, headers=DOWNLOAD_HEADERS)
 	response.raise_for_status()
 	content_type = response.headers.get("Content-Type", "").lower()
-	if "pdf" not in content_type and not filename.lower().endswith(".pdf"):
-		raise ValueError("链接不是PDF文件")
-	with open(file_path, "wb") as f:
-		for chunk in response.iter_content(chunk_size=1024 * 1024):
-			if chunk:
+	if "pdf" not in content_type:
+		raise ValueError(f"链接内容不是PDF文件: {content_type or 'unknown'}")
+	content_length = response.headers.get("Content-Length")
+	if content_length and int(content_length) > MAX_PDF_SIZE:
+		raise ValueError("PDF文件过大，无法处理")
+	downloaded_size = 0
+	try:
+		with open(file_path, "wb") as f:
+			for chunk in response.iter_content(chunk_size=1024 * 1024):
+				if not chunk:
+					continue
+				downloaded_size += len(chunk)
+				if downloaded_size > MAX_PDF_SIZE:
+					raise ValueError("PDF文件过大，无法处理")
 				f.write(chunk)
+	except Exception:
+		if os.path.exists(file_path):
+			os.remove(file_path)
+		raise
 	return file_path
 
 def request_ai_summary(prompt_content, file_path):
@@ -90,9 +125,9 @@ def request_ai_summary(prompt_content, file_path):
 	file_base64 = base64.b64encode(file_data).decode('utf-8')
 	mime_type = mimeTypes.get(os.path.splitext(file_path)[1].lower(), "application/octet-stream")
 	filename = os.path.basename(file_path)
-	api_url = "https://api.gpt.ge/v1/chat/completions"
+	api_url = AI_API_URL
 	payload = {
-		"model": "gemini-2.5-pro",
+		"model": AI_MODEL,
 		"messages": [{
 			"role": "user",
 			"content": [
@@ -116,9 +151,11 @@ def request_ai_summary(prompt_content, file_path):
 	response = requests.post(api_url, json=payload, headers=headers, timeout=120)
 	response.raise_for_status()
 	result = response.json()
+	if 'error' in result:
+		raise ValueError(result['error'])
 	content_text = result.get('choices', [{}])[0].get('message', {}).get('content', "")
 	if not content_text:
-		raise ValueError("AI接口未返回内容")
+		raise ValueError("AI接口返回内容格式不正确")
 	return content_text
 
 def summarize_paper_from_url(url, prompt_content, output_dir):
@@ -247,6 +284,8 @@ def thread_process(index):
 		prompt_content = f.read()
 	# 设置Authorization header
 	headers['Authorization'] = f"Bearer {system_config['Key']}"
+	if system_config['Key'] == "YOUR_API_KEY":
+		common.log_warning("检测到默认API Key，请更新config.ini中的Key配置")
 	
 	browser = open_browser(port)
 	main_page = browser.latest_tab
@@ -265,8 +304,14 @@ def thread_process(index):
 					try:
 						summary_path = summarize_paper_from_url(directory, SUMMARY_PROMPT, common.get_exe_dir())
 						common.log(f'''论文总结已保存：{summary_path}''')
+					except requests.exceptions.RequestException as e:
+						common.log_error(f"论文总结失败(网络错误): {e}")
+						common.log_error(traceback.format_exc())
+					except ValueError as e:
+						common.log_error(f"论文总结失败(数据错误): {e}")
 					except Exception as e:
-						common.log_error(f"论文总结失败: {e}")
+						common.log_error(f"论文总结失败(未知错误): {e}")
+						common.log_error(traceback.format_exc())
 					continue
 				if os.path.isdir(directory):
 					break
